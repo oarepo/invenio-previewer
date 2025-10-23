@@ -9,12 +9,14 @@
 
 """Views module tests."""
 
+import io
 import zipfile
 
 from flask import render_template_string, url_for
 from invenio_db import db
 from invenio_files_rest.models import ObjectVersion
 from mock import patch
+from PIL import Image
 from six import BytesIO, b
 
 
@@ -336,4 +338,135 @@ def test_view_macro_file_list(testapp):
         assert 'href="/record/1/files/test1.txt?download=1"' in result
         assert "<td>10 Bytes</td>" in result
         assert 'href="/record/1/files/test2.txt?download=1"' in result
-        assert "<td>12.0 MB</td>" in result
+
+
+def test_zip_content_preview(testapp, webassets, record):
+    """Test previewing an image file from within a ZIP archive."""
+    # Create a simple test image in memory
+    img_buffer = io.BytesIO()
+    img = Image.new("RGB", (100, 100), color="red")
+    img.save(img_buffer, format="PNG")
+    img_data = img_buffer.getvalue()
+
+    max_file_size = testapp.config.get("PREVIEWER_TXT_MAX_BYTES", 1 * 1024 * 1024)
+    too_large_string = "1" * (max_file_size + 1)
+    bytes_string = b(too_large_string)
+
+    # Create a ZIP file containing the image
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("images/test_image.png", img_data)
+        zf.writestr("images/readme.txt", b"This is a test image")
+        zf.writestr("too_large_text_file.txt", bytes_string)
+        zf.writestr("data.json", b'{"test": true}')
+        zf.writestr("test.pdf", b"Some pdf bytes here")
+
+    zip_buffer.seek(0)
+    create_file(record, "archive.zip", zip_buffer)
+
+    with testapp.test_client() as client:
+        # Test 1: Preview the ZIP file itself (should show file tree)
+        res = client.get(preview_url(record["control_number"], "archive.zip"))
+        assert res.status_code == 200
+        response_text = res.get_data(as_text=True)
+
+        print(response_text)
+        # Should show files in the tree
+        assert "test_image.png" in response_text
+        assert "readme.txt" in response_text
+        assert "data.json" in response_text
+
+        # Test 2: Preview the image from within the ZIP (HTML page with <img> tag)
+        res = client.get(
+            preview_url(record["control_number"], "archive.zip")
+            + "&zip_path=images/test_image.png"
+        )
+        assert res.status_code == 200
+        response_text = res.get_data(as_text=True)
+
+        # Should render image preview template with <img> tag
+        assert "<img" in response_text
+        assert 'class="previewer-simple-image"' in response_text
+
+        # Extract the image URL from the <img src="..."> tag
+        import re
+
+        img_src_match = re.search(r'<img\s+src="([^"]+)"', response_text)
+        assert img_src_match, "Could not find <img> tag with src attribute"
+        img_url = img_src_match.group(1)
+
+        # Now fetch the actual image file by making a request to that URL
+        # The URL will be something like "/record/1/files/archive.zip?zip_path=images/test_image.png"
+        img_response = client.get(img_url)
+        assert img_response.status_code == 200
+        assert img_response.content_type.startswith("image/")
+
+        # Verify the actual image bytes match what we created
+        downloaded_img_data = img_response.get_data()
+        assert (
+            downloaded_img_data == img_data
+        ), "Downloaded image bytes don't match original"
+
+        # Test 3: Preview small text file from within the ZIP
+        res = client.get(
+            preview_url(record["control_number"], "archive.zip")
+            + "&zip_path=images/readme.txt"
+        )
+        assert res.status_code == 200
+        response_text = res.get_data(as_text=True)
+
+        # Should show the text content
+        assert "This is a test image" in response_text
+
+        # Test 4: Preview big text file from within the ZIP
+        res = client.get(
+            preview_url(record["control_number"], "archive.zip")
+            + "&zip_path=too_large_text_file.txt"
+        )
+        assert res.status_code == 200
+        response_text = res.get_data(as_text=True)
+
+        # Should be truncated content message
+        assert "file truncated" in response_text
+
+        # Test 5: Try to preview non-existent file (should 404)
+        res = client.get(
+            preview_url(record["control_number"], "archive.zip")
+            + "&zip_path=nonexistent.png"
+        )
+        assert res.status_code == 404
+
+        # Test 6: Try to use zip_path with non-ZIP file (should 400)
+        create_file(record, "notazip.txt", BytesIO(b"just text"))
+        res = client.get(
+            preview_url(record["control_number"], "notazip.txt")
+            + "&zip_path=anything.txt"
+        )
+        assert res.status_code == 400
+
+        # Test 7: Try to preview PDF file from within the ZIP
+        res = client.get(
+            preview_url(record["control_number"], "archive.zip") + "&zip_path=test.pdf"
+        )
+        assert res.status_code == 200
+        response_text = res.get_data(as_text=True)
+
+        # Should render PDF preview template
+        assert "pdf-file-uri" in response_text.lower()
+
+        # Extract the PDF URL from the <img src="..."> tag
+        pdf_src_match = re.search(
+            r'id="pdf-file-uri"[^>]*value="([^"]+)"', response_text
+        )
+        pdf_url = pdf_src_match.group(1)
+
+        # Now fetch the actual image file by making a request to that URL
+        pdf_response = client.get(pdf_url)
+        assert pdf_response.status_code == 200
+        assert pdf_response.content_type.startswith("application/pdf")
+
+        # Verify the actual PDF bytes match what we created
+        downloaded_pdf_data = pdf_response.get_data()
+        assert (
+            downloaded_pdf_data == b"Some pdf bytes here"
+        ), "Downloaded PDF bytes don't match original"

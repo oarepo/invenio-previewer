@@ -57,7 +57,7 @@ def app_config(app_config):
             recid_files=dict(
                 pid_type="recid",
                 route="/record/<pid_value>/files/<filename>",
-                view_imp="invenio_records_files.utils.file_download_ui",
+                view_imp="invenio_previewer.views:file_download_ui",
                 record_class="invenio_records_files.api:Record",
             ),
         ),
@@ -192,5 +192,5 @@ def zip_fp(db):
     zipf.writestr("Lé UTF8 test.txt", "This is an example".encode("utf-8"))
     zipf.close()
 
-    fp.seek(0)
-    return fp
+        fp.seek(0)
+        return fp
