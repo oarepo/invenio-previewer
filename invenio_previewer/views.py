@@ -10,7 +10,7 @@
 
 from flask import Blueprint, abort, current_app, request
 
-from .api import PreviewFile
+from .api import create_preview_file
 from .extensions import default
 from .proxies import current_previewer
 
@@ -38,21 +38,47 @@ def preview(pid, record, template=None, **kwargs):
                 record_class='invenio_records_files.api:Record',
             )
         )
+
+    Supports previewing files within ZIP archives via 'zip_path' query parameter:
+
+        /records/123/preview/archive.zip?zip_path=folder/image.png
+
+    The file is streamed directly from the ZIP without full extraction,
+    allowing preview of large files (images, PDFs, etc.) without memory overhead.
     """
     # Get file from record
-    fileobj = current_previewer.record_file_factory(
-        pid,
-        record,
-        request.view_args.get("filename", request.args.get("filename", type=str)),
-    )
+    filename = request.view_args.get("filename", request.args.get("filename", type=str))
+    fileobj = current_previewer.record_file_factory(pid, record, filename)
+
     if not fileobj:
         abort(404)
 
-    # Try to see if specific previewer is set
-    file_previewer = fileobj.get("previewer")
+    # Create the appropriate file object (regular or ZIP-extracted)
+    zip_path = request.args.get("zip_path")
+    try:
+        fileobj = create_preview_file(pid, record, fileobj, zip_path)
+    except ValueError as e:
+        # Invalid container type (e.g., zip_path on non-ZIP file)
+        abort(400, str(e))
+    except FileNotFoundError as e:
+        # File not found in ZIP archive
+        abort(404, str(e))
+    except Exception as e:
+        current_app.logger.error(
+            f"Error creating preview file: {str(e)}", exc_info=True
+        )
+        abort(500, "Error accessing file")
 
-    # Find a suitable previewer
-    fileobj = PreviewFile(pid, record, fileobj)
+    # Try to see if specific previewer is set (only for non-ZIP files)
+    file_previewer = None
+    if not zip_path:
+        file_previewer = (
+            fileobj.file.get("previewer")
+            if hasattr(fileobj, "file") and isinstance(fileobj.file, dict)
+            else None
+        )
+    print(f"{list(current_previewer.iter_previewers(None))=}")
+    # Find a suitable previewer and render
     for plugin in current_previewer.iter_previewers(
         previewers=[file_previewer] if file_previewer else None
     ):
@@ -71,6 +97,83 @@ def preview(pid, record, template=None, **kwargs):
                     exc_info=True,
                 )
     return default.preview(fileobj)
+
+
+def file_download_ui(pid, record, template=None, **kwargs):
+    """Download file from record, with support for ZIP extraction.
+
+    This wraps the standard file download functionality and adds support
+    for extracting and streaming files from within ZIP archives.
+
+    Use this in your RECORDS_UI_ENDPOINTS configuration:
+
+    .. code-block:: python
+
+        RECORDS_UI_ENDPOINTS = dict(
+            recid_files=dict(
+                pid_type='recid',
+                route='/record/<pid_value>/files/<filename>',
+                view_imp='invenio_previewer.views:file_download_ui',
+                record_class='invenio_records_files.api:Record',
+            )
+        )
+
+    Supports extracting files from ZIP archives via 'zip_path' query parameter:
+
+        /record/123/files/archive.zip?zip_path=folder/image.png
+
+    The file is streamed directly from the ZIP without full extraction.
+    """
+    import mimetypes
+
+    from flask import Response
+
+    # Get file from record
+    filename = request.view_args.get("filename")
+    fileobj = current_previewer.record_file_factory(pid, record, filename)
+
+    if not fileobj:
+        abort(404)
+
+    # Check if we're downloading a file from within a ZIP archive
+    zip_path = request.args.get("zip_path")
+
+    if zip_path:
+        # Use factory to create ZipExtractedFile
+        try:
+            extracted_file = create_preview_file(pid, record, fileobj, zip_path)
+        except ValueError as e:
+            abort(400, str(e))
+        except FileNotFoundError as e:
+            abort(404, str(e))
+        except Exception as e:
+            current_app.logger.error(
+                f"Error accessing file in ZIP: {str(e)}", exc_info=True
+            )
+            abort(500, "Error accessing file in ZIP archive")
+
+        # Determine MIME type from filename
+        mimetype, _ = mimetypes.guess_type(extracted_file.filename)
+        if mimetype is None:
+            mimetype = "application/octet-stream"
+
+        # Stream the file from the ZIP
+        file_stream = extracted_file.open()
+
+        # Return the file as a streaming response
+        return Response(
+            file_stream,
+            mimetype=mimetype,
+            headers={
+                "Content-Disposition": f'inline; filename="{extracted_file.filename}"',
+                "Content-Length": str(extracted_file.size),
+            },
+        )
+    else:
+        # Standard file download - delegate to the original function
+        from invenio_records_files.utils import file_download_ui as original_download
+
+        return original_download(pid, record, **kwargs)
 
 
 @blueprint.app_template_test("previewable")
